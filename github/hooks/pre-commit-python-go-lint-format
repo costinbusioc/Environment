@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+
+# The script runs the following checks on the commited files:
+# - GO linting using golangci-lint
+# - GO formatting using gofmt
+# - Python linting using pylint
+# - Python formatting using yapf
+# - no debugging code (prints, pdb) is present in the changed files
+
+# Skips all checks for a language if no changed files found for that language
+
+# - For linting, if issues are found the commit is aborted and you are prompted to fix them
+# - For formatting, the script auto-formats the changed files; You have to check the changes (git diff), stage them and rerun the commit command
+
+# How to use: 
+# - Save this into .git/hooks/pre-commit
+# - Run `chmod +x .git/hooks/pre-commit`
+
+function sanity_checks() {
+
+  # Check that the tools used by this script are installed. 
+  # Skipped if NOCHECKS environment variable is set.
+  if [ -z "$NOCHECKS" ]; then
+    if ! command -v pylint >/dev/null; then
+      echo 'pylint not installed. Please install it' 
+      exit 2
+    fi
+
+    if ! command -v yapf >/dev/null; then
+      echo 'yapf not installed Please install it'
+      exit 2
+    fi
+
+    if ! command -v pylint-exit >/dev/null; then
+      echo 'pylint-exit not installed. Please install it' 
+      exit 2
+    fi
+
+    if ! command -v gofmt >/dev/null; then
+      echo 'gofmt not installed. Please install it' 
+      exit 2
+    fi
+
+    if ! command -v golangci-lint >/dev/null; then
+      echo 'golangci-lint not installed. Please install it' 
+      exit 2
+    fi
+
+    echo "export NOCHECKS=1" >> ~/.bash_profile
+    export NOCHECKS=1
+  fi
+}
+
+function print_array {
+  array=("$@")
+  for element in ${array[@]}; do
+      printf "\t%s\n" $element
+  done
+}
+
+EXIT_STATUS=0 # everything is fine, changes will be commited
+
+PYTHON_FILES=()
+while read line; do 
+  PYTHON_FILES=("${PYTHON_FILES[@]}" $line)
+done \
+< <(git diff --name-only --cached --diff-filter=AM | grep --color=never '.py$')
+if [ ${#PYTHON_FILES[@]} -eq 0 ]; then
+    printf '%bSKIPPED...Python checks%b\n' "\e[93m" "\e[39m"
+fi
+
+GO_FILES=()
+while read line; do 
+  GO_FILES=("${GO_FILES[@]}" $line)
+done \
+< <(git diff --name-only --cached --diff-filter=AM | grep --color=never '.go$')
+if [ ${#GO_FILES[@]} -eq 0 ]; then
+    printf '%bSKIPPED...Go checks%b\n' "\e[93m" "\e[39m"
+fi
+
+
+function verify_no_files_changed {
+  CHANGED_FILES=()
+  while IFS=$'\n' read -r line; do CHANGED_FILES+=("$line"); done < <(git diff --name-only "${@:2}")
+  if [ ${#CHANGED_FILES[@]} -gt 0 ]; then
+    printf "%bFAILED....%s%b\n\t Reformatted %s files. Please review and recommit\n" "\e[91m" $(echo $1) "\e[39m" ${#CHANGED_FILES[@]}
+    EXIT_STATUS=1
+  else
+    printf "%bSUCCESS...%s%b\n" "\e[92m" $1 "\e[39m" 
+  fi
+}
+
+function python_formatting {
+  # make changes in place, iterate recursive over dirs, exclude given patterns
+
+  printf '%bChecking python formatting...%b' "\e[93m" "\e[39m"
+  yapf -i -r -e "*pb2.py" -e "*pb2_grpc.py" "${PYTHON_FILES[@]}" 
+  printf "\r%b" '\033[2K'
+
+  verify_no_files_changed python_formatting "${PYTHON_FILES[@]}" 
+}
+
+function golang_formatting {
+  # make changes in place, report all errors
+  printf '%bChecking golang formatting...%b' "\e[93m" "\e[39m"
+  gofmt -w -e "${GO_FILES[@]}"
+  printf "\r%b" '\033[2K'
+
+  verify_no_files_changed golang_formatting "${GO_FILES[@]}" 
+}
+
+function python_linting {
+  printf '%bChecking python linting...%b' "\e[93m" "\e[39m"
+  lint_output=$(pylint "${PYTHON_FILES[@]}" 2>&1)
+  printf "\r%b" '\033[2K'
+
+  if [ $? -ne 0 ]; then
+    b=${lint_output%Report*}
+    c=${b#*E:\ }
+
+    EXIT_STATUS=1
+    printf "%bFAILED....python linting:%b\n\t%s\n" "\e[91m" "\e[39m" $c 
+  else 
+    printf '%bSUCCESS...python linting%b\n' "\e[92m" "\e[39m"
+  fi
+}
+
+# known issues/nice to have: 
+# 1. having the following changed files: A/B/f1.go A/f2.go will run linting on A/B/... and A/... 
+#    which means errors from B will be reported twice
+# 2. would be nice to extract all usages of current files' code and run linting on that too
+function golang_linting {
+  printf '%bChecking golang linting...%b' "\e[93m" "\e[39m"
+
+  old_path=$(pwd)
+  cd ~/analytics/analytics
+
+  UNIQUE_DIRS=($(for v in "${GO_FILES[@]}"; do echo $(dirname $v); done | sort | uniq | xargs ))
+
+  LINTING_ISSUES=()
+  for file in "${UNIQUE_DIRS[@]}"; do 
+    lint_output=$(golangci-lint run --exclude-use-default=false --out-format colored-line-number $file'/...')
+    if [ $? -ne 0 ]; then
+      LINTING_ISSUES=("${LINTING_ISSUES[@]}" $lint_output)
+    fi
+  done
+
+  printf "\r%b" '\033[2K'
+  if [ ${#LINTING_ISSUES[@]} -eq 0 ]; then
+    printf "%bSUCCESS...golang linting%b\n" "\e[92m" "\e[39m"
+  else
+    EXIT_STATUS=1
+    printf "%bFAILED....golang linting:%b\n" "\e[91m" "\e[39m"
+    printf  "\t"
+    echo  "${LINTING_ISSUES[@]}"
+  fi
+
+  cd $old_path
+}
+
+function verify_no_debugging_code {
+  printf '%bChecking that no debugging code (prints/pdb) is present in the changed files...%b' "\e[93m" "\e[39m"
+
+  # 1. Search for fmt.Print in GO files
+  FAILED=()
+  for file in "${GO_FILES[@]}"; do 
+    prints=$(grep "fmt.Print" $file -n --with-filename)
+    if [[ ! -z $prints ]] ; then
+      line=$(echo $prints | cut -d: -f1-2)
+      FAILED=("${FAILED[@]}" $line)
+    fi
+  done
+
+  
+  for file in "${PYTHON_FILES[@]}"; do 
+    # 2. Search for print in Python files, exclude comments
+    prints=$(grep -v -e "^[[:space:]]*#.*$" $file -n --with-filename | grep print | grep -v printable)
+    if [[ ! -z $prints ]] ; then
+      line=$(echo $prints | cut -d: -f1-2)
+      FAILED=("${FAILED[@]}" $line)
+    fi
+
+    # 3. Search for pdb in Python files
+    prints=$(grep "pdb" $file -n --with-filename)
+    if [[ ! -z $prints ]] ; then
+      line=$(echo $prints | cut -d: -f1-2)
+      FAILED=("${FAILED[@]}" $line)
+    fi
+  done
+
+  printf "\r%b" '\033[2K'
+  if [ ${#FAILED[@]} -ne 0 ]; then
+    EXIT_STATUS=1
+    printf "%bFAILED....debugging code checks:%b\n" "\e[91m" "\e[39m"
+    print_array "${FAILED[@]}"
+  else 
+    printf '%bSUCCESS...debugging code checks%b\n' "\e[92m" "\e[39m"
+  fi
+}
+
+# run checks
+sanity_checks
+
+verify_no_debugging_code
+
+if [ ${#PYTHON_FILES[@]} -gt 0 ]; then
+  python_linting
+  python_formatting
+fi
+
+if [ ${#GO_FILES[@]} -gt 0 ]; then
+  golang_formatting
+  golang_linting
+fi
+
+
+exit $EXIT_STATUS
