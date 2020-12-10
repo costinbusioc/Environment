@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+
+# This script extract the JIRA issue number from the branch name and
+# appends it to the commit message
+
+# How to use: 
+# - Save this into .git/hooks/commit-msg
+# - Run `chmod +x .git/hooks/commit-msg`
+
+
+COMMIT_FILE=$1
+COMMIT_MSG=$(cat $1)
+CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+JIRA_ID=$(echo "$CURRENT_BRANCH" | grep -Eo "[A-Z0-9]{1,10}-?[A-Z0-9]+-\d+")
+
+if [ ! -z "$JIRA_ID" ]; then
+  echo "$COMMIT_MSG #$JIRA_ID" > $COMMIT_FILE
+  printf "%bSUCCESS...jira id%b\n" "\e[92m" "\e[39m"
+fi
